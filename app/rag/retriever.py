@@ -128,4 +128,3 @@ class LessonRetriever:
 def get_retriever() -> LessonRetriever:
     """Return a cached, process-wide LessonRetriever instance (dependency-injection friendly)."""
     return LessonRetriever()
-عدل الكود وابعتلي الكود بعد التعديل 
