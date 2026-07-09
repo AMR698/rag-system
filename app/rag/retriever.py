@@ -5,15 +5,29 @@ IMPORTANT: This module does NOT create embeddings and does NOT create
 a new collection. It only CONNECTS to the existing, already-embedded
 ChromaDB collection (created by a separate embedding pipeline) and
 retrieves chunks that belong to a specific `lesson_id`.
+
+Two retrieval strategies are exposed:
+    1. get_lesson_context(lesson_id)  -> returns ALL chunks for that
+       lesson, concatenated. Used to build the full context sent to
+       the question generator.
+    2. semantic_search(lesson_id, query, top_k) -> returns the most
+       relevant chunks for a specific query, still scoped to the
+       lesson via a metadata filter. Useful if the lesson is very
+       large and only a slice of it is relevant to a sub-topic.
+
+LangChain's Chroma vectorstore wrapper is used on top of the native
+chromadb PersistentClient so that the same embedding function
+(SentenceTransformers) used at ingestion time is reused consistently
+for any query-time embedding.
 """
 
 from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from typing import Optional
 
 import chromadb
-from chromadb.config import Settings as ChromaSettings
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -29,148 +43,89 @@ class RetrieverError(Exception):
 class LessonRetriever:
     """
     Loads the existing Chroma collection and exposes lesson-scoped
-    retrieval methods.
+    retrieval methods. Embeddings are NEVER recreated here.
     """
 
     def __init__(self) -> None:
         settings = get_settings()
         self._settings = settings
 
-        logger.info(
-            "Connecting to existing Chroma store at %s",
-            settings.CHROMA_DB_PATH,
-        )
+        logger.info("Connecting to existing Chroma store at %s", settings.CHROMA_DB_PATH)
+        self._client = chromadb.PersistentClient(path=settings.CHROMA_DB_PATH)
 
-        try:
-            # Connect to persistent ChromaDB
-            self._client = chromadb.PersistentClient(
-                path=settings.CHROMA_DB_PATH,
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                ),
-            )
+        # Load the already-existing collection (do NOT create a new one).
+        self._collection = self._client.get_collection(name=settings.COLLECTION_NAME)
 
-            # Load existing collection
-            self._collection = self._client.get_collection(
-                name=settings.COLLECTION_NAME
-            )
+        # Embedding function reused only for query-time embedding (LangChain wrapper).
+        self._embeddings = HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
 
-        except Exception as exc:
-            logger.exception("Failed to initialize ChromaDB")
-            raise RetrieverError(
-                f"Could not connect to ChromaDB collection "
-                f"'{settings.COLLECTION_NAME}': {exc}"
-            ) from exc
-
-        # Query embedding model
-        self._embeddings = HuggingFaceEmbeddings(
-            model_name=settings.EMBEDDING_MODEL
-        )
-
-        # LangChain wrapper
         self._vectorstore = Chroma(
             client=self._client,
             collection_name=settings.COLLECTION_NAME,
             embedding_function=self._embeddings,
         )
 
-        logger.info(
-            "Connected successfully to collection '%s'",
-            settings.COLLECTION_NAME,
-        )
-
-    def get_lesson_context(
-        self,
-        lesson_id: str,
-        max_chunks: int = 50,
-    ) -> str:
+    def get_lesson_context(self, lesson_id: str, max_chunks: int = 50) -> str:
         """
-        Retrieve all chunks belonging to a lesson.
-        """
+        Retrieve ALL chunks whose metadata["lesson_id"] == lesson_id
+        and merge them into a single context string.
 
+        Args:
+            lesson_id: The lesson selected by the player.
+            max_chunks: Safety cap on how many chunks to merge, to
+                avoid overflowing the LLM context window.
+
+        Returns:
+            A single string with all lesson chunks concatenated, or an
+            empty string if no chunks were found for that lesson.
+        """
         try:
             result = self._collection.get(
                 where={"lesson_id": lesson_id},
                 limit=max_chunks,
-                include=[
-                    "documents",
-                    "metadatas",
-                    "ids",
-                ],
+                include=["documents", "metadatas"],
             )
-
-        except Exception as exc:
-            logger.exception(
-                "Chroma get() failed for lesson_id=%s",
-                lesson_id,
-            )
-            raise RetrieverError(
-                f"Failed to retrieve lesson '{lesson_id}': {exc}"
-            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Chroma get() failed for lesson_id=%s", lesson_id)
+            raise RetrieverError(f"Failed to retrieve lesson '{lesson_id}': {exc}") from exc
 
         documents = result.get("documents") or []
-
         if not documents:
-            logger.warning(
-                "No chunks found for lesson_id=%s",
-                lesson_id,
-            )
+            logger.warning("No chunks found for lesson_id=%s", lesson_id)
             return ""
 
         merged = "\n\n".join(documents)
-
-        logger.info(
-            "Retrieved %d chunks for lesson_id=%s",
-            len(documents),
-            lesson_id,
-        )
-
+        logger.info("Retrieved %d chunks for lesson_id=%s", len(documents), lesson_id)
         return merged
 
-    def semantic_search(
-        self,
-        lesson_id: str,
-        query: str,
-        top_k: int = 4,
-    ) -> list[str]:
+    def semantic_search(self, lesson_id: str, query: str, top_k: int = 4) -> list[str]:
         """
-        Semantic search restricted to a specific lesson.
-        """
+        Retrieve the top_k most relevant chunks for `query`, restricted
+        to the given lesson_id via a metadata filter.
 
+        Useful for large lessons where only a portion of the content
+        is relevant to a specific sub-topic or follow-up question.
+        """
         try:
             docs = self._vectorstore.similarity_search(
                 query=query,
                 k=top_k,
                 filter={"lesson_id": lesson_id},
             )
-
-        except Exception as exc:
-            logger.exception(
-                "Semantic search failed for lesson_id=%s",
-                lesson_id,
-            )
-            raise RetrieverError(
-                f"Semantic search failed: {exc}"
-            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Semantic search failed for lesson_id=%s", lesson_id)
+            raise RetrieverError(f"Semantic search failed: {exc}") from exc
 
         return [doc.page_content for doc in docs]
 
     def lesson_exists(self, lesson_id: str) -> bool:
-        """
-        Check whether the lesson exists.
-        """
-
-        result = self._collection.get(
-            where={"lesson_id": lesson_id},
-            limit=1,
-        )
-
+        """Quick check used by the API layer to validate a lesson_id before starting a session."""
+        result = self._collection.get(where={"lesson_id": lesson_id}, limit=1)
         return bool(result.get("documents"))
 
 
 @lru_cache
 def get_retriever() -> LessonRetriever:
-    """
-    Return a singleton retriever instance.
-    """
+    """Return a cached, process-wide LessonRetriever instance (dependency-injection friendly)."""
     return LessonRetriever()
+عدل الكود وابعتلي الكود بعد التعديل 
